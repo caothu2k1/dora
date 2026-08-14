@@ -10,8 +10,8 @@
 use shared_memory_extended::{Shmem, ShmemConf};
 
 use crate::doradma::{
-    self, OFFSET_WRITE_GEN, ParsedHeader, data_offset_for, metadata_json, parse_header,
-    write_header,
+    self, HEADER_SIZE, OFFSET_WRITE_GEN, ParsedHeader, data_offset_for, metadata_json,
+    parse_header, write_header,
 };
 use crate::naming;
 use crate::seqlock;
@@ -302,7 +302,14 @@ impl PoolSegment {
         // possible concurrent accessor.
         let header = {
             let buf = unsafe { std::slice::from_raw_parts_mut(shmem.as_ptr(), total) };
-            write_header(buf, &json).and_then(|()| parse_header(buf, total))
+            write_header(buf, &json).and_then(|()| {
+                // Same two-slice shape `open` uses. Not required for soundness
+                // here — nothing else can touch this segment yet — but keeping
+                // one call shape means the parser is exercised the same way on
+                // both paths.
+                let (fixed, rest) = buf.split_at(HEADER_SIZE);
+                parse_header(&fixed[..OFFSET_WRITE_GEN], &rest[..json.len()], total)
+            })
         };
         let header = match header {
             Ok(header) => header,
@@ -343,31 +350,42 @@ impl PoolSegment {
         // Two steps so that no `&[u8]` ever covers the payload. The payload is
         // being written by a peer process, and a shared reference to it would
         // alias a concurrent write — UB whether or not anything reads through
-        // the reference. The magic, the two lengths, the IPC flag and handle,
-        // and the metadata JSON are all written once, before the pool is
-        // registered, and a consumer only learns the pool exists through that
-        // registration — so referencing them races with nothing.
+        // the reference. Two spans are referenced and neither is mutated after
+        // registration: the fixed header below byte 96, and the metadata JSON.
+        // Both are written once, before the pool is registered, and a consumer
+        // only learns the pool exists through that registration.
         //
-        // One field inside the span is NOT write-once: the seqlock generation
-        // at byte 96, which a peer writer stores to on every frame. Nothing
-        // here reads it — `parse_header` deliberately does not decode it, and
-        // every generation access goes through `gen_ptr()` as an `AtomicU64` —
-        // but the reference still covers those 8 bytes. Narrowing it needs the
-        // fixed header and the JSON passed as two slices (all the fixed fields
-        // this parses live below offset 96); that is a follow-up, not a
-        // correctness hole today.
+        // The gap between them is deliberate. Byte 96 is the seqlock
+        // generation, which a peer writer stores to through an `AtomicU64` on
+        // every frame; a shared reference spanning it would be a data race
+        // whether or not anything read through it. Every fixed field
+        // `parse_header` decodes lives below 96 — `ipc_handle` is the last, at
+        // 32..96 — so excluding it costs nothing.
         //
-        // `header_region_len` caps the length at `data_offset`, so the slice
+        // `header_region_len` caps the JSON slice at `data_offset`, so it
         // provably stops at the payload start rather than merely inside the
-        // mapping. It reads only bytes 0..HEADER_SIZE, which is why the first
-        // slice is clamped to the mapping length.
-        let region_len = {
-            let fixed = unsafe {
-                std::slice::from_raw_parts(base, segment_bytes.min(doradma::HEADER_SIZE))
-            };
-            doradma::header_region_len(fixed, segment_bytes).map_err(name_err)?
+        // mapping.
+        // Stops at OFFSET_WRITE_GEN, not HEADER_SIZE: byte 96 is the seqlock
+        // generation and is excluded from both slices below.
+        let fixed_header = unsafe {
+            std::slice::from_raw_parts(base, segment_bytes.min(doradma::OFFSET_WRITE_GEN))
         };
-        let header_region = unsafe { std::slice::from_raw_parts(base, region_len) };
+        // The whole point of the split, machine-checked rather than trusted to
+        // the `min` above surviving an edit.
+        debug_assert!(
+            fixed_header.len() <= doradma::OFFSET_WRITE_GEN,
+            "the fixed-header slice must never span the seqlock generation word"
+        );
+        let region_len =
+            doradma::header_region_len(fixed_header, segment_bytes).map_err(name_err)?;
+        // `header_region_len` returned HEADER_SIZE + json_len and proved it is
+        // <= data_offset <= segment_bytes, so this is in bounds.
+        let json_bytes = unsafe {
+            std::slice::from_raw_parts(
+                base.add(doradma::HEADER_SIZE),
+                region_len - doradma::HEADER_SIZE,
+            )
+        };
 
         // `parse_header` has already validated `data_offset`, `json_len` and
         // the declared payload size against the mapping length, and derived the
@@ -376,7 +394,7 @@ impl PoolSegment {
         // a size check applied unconditionally would reject every
         // Python-written CUDA pool, whose segment is header-only while its JSON
         // still declares the full tensor size.
-        let header = parse_header(header_region, segment_bytes).map_err(name_err)?;
+        let header = parse_header(fixed_header, json_bytes, segment_bytes).map_err(name_err)?;
         // Machine-checks what `header_region_len` promised, against the
         // authoritative parsed value rather than the raw one it read.
         debug_assert!(
