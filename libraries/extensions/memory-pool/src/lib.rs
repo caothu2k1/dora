@@ -3,8 +3,10 @@ pub mod naming;
 pub mod segment;
 // Crate-private: its writer half publishes a generation from a raw pointer and
 // a caller-supplied token, which is precisely what `PoolSegment`'s write cycle
-// exists to make unreachable. `segment` re-exports `OpeningSample`, the only
-// part of it that appears in a public signature.
+// exists to make unreachable. Nothing here reaches a public signature any more
+// — `SlotRead` wraps `OpeningSample` and is what `PoolSegment::begin_read_at`
+// hands out — but `segment` still re-exports it so `SlotRead`'s own docs have
+// something to link to.
 pub(crate) mod seqlock;
 
 use std::collections::{HashMap, HashSet};

@@ -471,7 +471,16 @@ mod ffi {
         /// the generation odd permanently, which kills the pool for every
         /// reader until some later successful write, and nothing on the Rust
         /// side recovers it.
-        fn pool_begin_write(pool: &mut Box<DoraMemoryPool>) -> DoraResult;
+        ///
+        /// `slot` selects which generation word brackets the cycle. A payload
+        /// that is one buffer passes 0. A payload that is a ring of slots
+        /// passes the slot it is about to fill, so that readers holding the
+        /// other slots are not told their frames tore: with one word for the
+        /// whole segment they were, on every write, and a four-slot ring
+        /// therefore rejected three intact frames for every genuine tear.
+        /// Slots run to 20; past that the call fails rather than folding onto
+        /// slot 0.
+        fn pool_begin_write(pool: &mut Box<DoraMemoryPool>, slot: usize) -> DoraResult;
         /// Close a write cycle; a no-op when none is open. `ok = false` leaves
         /// the pool marked incomplete — every reader rejects it until the next
         /// successful write — because an in-place write has already destroyed
@@ -639,6 +648,12 @@ mod ffi {
         /// `view_payload_len()` bytes. Size `dst` from `view_payload_len()`,
         /// or use `dora::try_read_pool` (`dora/memory_pool.hpp`) which does,
         /// and then a false can only mean the retryable case.
+        ///
+        /// **Not for a payload used as a ring of slots.** It copies the whole
+        /// payload, which spans every slot, and no single generation covers
+        /// that — it brackets with slot 0's, so a write to any other slot goes
+        /// undetected here. A ring reads one slot at a time through
+        /// `view_begin_read`.
         fn view_try_read(view: &Box<DoraMemoryPoolView>, dst: &mut [u8]) -> bool;
 
         /// Open a zero-copy read by sampling the pool's generation.
@@ -653,13 +668,18 @@ mod ffi {
         /// and it is bound to the view that issued it. Prefer
         /// `dora::PoolReadGuard` (`dora/memory_pool.hpp`), which keeps the
         /// token, the pointer and the length together.
-        fn view_begin_read(view: &Box<DoraMemoryPoolView>) -> Box<DoraPoolRead>;
+        ///
+        /// `slot` names the generation word to sample, and must be the slot
+        /// whose bytes are about to be read — see `pool_begin_write`. It
+        /// travels inside the token, so `view_read_valid` cannot be given a
+        /// different one.
+        fn view_begin_read(view: &Box<DoraMemoryPoolView>, slot: usize) -> Box<DoraPoolRead>;
         /// True when the payload read since `view_begin_read` is intact: no
-        /// write started or finished in between, the pool is still alive, and
-        /// the token came from this view. A token from a different view is
-        /// rejected rather than compared — two views of the same segment share
-        /// a generation word, so comparing it would accept a bracket that
-        /// never enclosed the read.
+        /// write started or finished **on that slot** in between, the pool is
+        /// still alive, and the token came from this view. A token from a
+        /// different view is rejected rather than compared — two views of the
+        /// same segment share their generation words, so comparing one would
+        /// accept a bracket that never enclosed the read.
         fn view_read_valid(view: &Box<DoraMemoryPoolView>, read: &Box<DoraPoolRead>) -> bool;
 
         /// Ids of pools freed by any node since the last call.
@@ -1930,8 +1950,8 @@ fn pool_shape(pool: &Box<DoraMemoryPool>) -> Vec<usize> {
     pool.segment.shape().to_vec()
 }
 
-fn pool_begin_write(pool: &mut Box<DoraMemoryPool>) -> ffi::DoraResult {
-    match pool.segment.begin_write() {
+fn pool_begin_write(pool: &mut Box<DoraMemoryPool>, slot: usize) -> ffi::DoraResult {
+    match pool.segment.begin_write_at(slot) {
         Ok(()) => ffi::DoraResult {
             error: String::new(),
         },
@@ -2008,7 +2028,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use dora_memory_pool::segment::OpeningSample;
+use dora_memory_pool::segment::SlotRead;
 
 /// Liveness flags of every open view, keyed by pool id.
 ///
@@ -2047,13 +2067,15 @@ pub struct DoraMemoryPoolView {
 /// The opening generation sample of a zero-copy read, plus the serial of the
 /// view that took it.
 ///
-/// Opaque to C++, which is the point: `OpeningSample` is deliberately not a
-/// number even in Rust, and flattening it to a `uint64_t` here would hand the
-/// caller something it could forge, compare with the wrong fence, or hold
-/// across frames — exactly what the type exists to prevent.
+/// Opaque to C++, which is the point: `SlotRead` is deliberately not a number
+/// even in Rust, and flattening it to a `uint64_t` here would hand the caller
+/// something it could forge, compare with the wrong fence, or hold across
+/// frames — exactly what the type exists to prevent. The slot rides inside it
+/// for the same reason: a caller that could name the slot again at
+/// `view_read_valid` could name a different one.
 pub struct DoraPoolRead {
     view_serial: u64,
-    sample: OpeningSample,
+    sample: SlotRead,
 }
 
 /// Register a mapped segment as a live view. Shared with the tests, which have
@@ -2286,10 +2308,10 @@ fn view_try_read(view: &Box<DoraMemoryPoolView>, dst: &mut [u8]) -> bool {
 }
 
 #[allow(clippy::borrowed_box)] // signature dictated by cxx::bridge
-fn view_begin_read(view: &Box<DoraMemoryPoolView>) -> Box<DoraPoolRead> {
+fn view_begin_read(view: &Box<DoraMemoryPoolView>, slot: usize) -> Box<DoraPoolRead> {
     Box::new(DoraPoolRead {
         view_serial: view.serial,
-        sample: view.segment.begin_read(),
+        sample: view.segment.begin_read_at(slot),
     })
 }
 
@@ -4213,13 +4235,44 @@ mod tests {
             writer.write(&[1; 32]).expect("write a frame");
             let view = Box::new(view);
 
-            let read = view_begin_read(&view);
+            let read = view_begin_read(&view, 0);
             assert!(view_read_valid(&view, &read));
 
             writer.write(&[2; 32]).expect("write another frame");
             assert!(
                 !view_read_valid(&view, &read),
                 "a frame written during the read must invalidate it"
+            );
+        }
+
+        /// A consumer reading one slot of a ring must not be told its frame
+        /// tore because the producer filled a different slot. This is the
+        /// property the whole generation array exists for, checked here across
+        /// the bridge rather than only inside `dora-memory-pool`, because it
+        /// is the C++ side that reads a ring.
+        #[test]
+        fn a_zero_copy_read_survives_a_write_to_a_different_slot() {
+            let (_guard, mut writer, view) = writer_and_view("ringslot", 32);
+            writer.write(&[1; 32]).expect("write a frame");
+            let view = Box::new(view);
+
+            let read = view_begin_read(&view, 0);
+            assert!(view_read_valid(&view, &read));
+
+            for slot in 1..4 {
+                writer.begin_write_at(slot).expect("open a write cycle");
+                writer.end_write(true);
+            }
+            assert!(
+                view_read_valid(&view, &read),
+                "writes to slots 1..4 must leave a read of slot 0 intact"
+            );
+
+            writer.begin_write_at(0).expect("open a write cycle");
+            writer.end_write(true);
+            assert!(
+                !view_read_valid(&view, &read),
+                "a write to slot 0 must still invalidate it"
             );
         }
 
@@ -4233,7 +4286,7 @@ mod tests {
             let second = Box::new(open_view(&guard));
             let first = Box::new(first);
 
-            let read = view_begin_read(&first);
+            let read = view_begin_read(&first, 0);
             assert!(view_read_valid(&first, &read), "valid on its own view");
             assert!(
                 !view_read_valid(&second, &read),
@@ -4247,7 +4300,7 @@ mod tests {
             writer.write(&[4; 32]).expect("write a frame");
             let view = Box::new(view);
 
-            let read = view_begin_read(&view);
+            let read = view_begin_read(&view, 0);
             assert!(view_read_valid(&view, &read));
             mark_freed(vec![guard.pool_id.clone()]);
             assert!(

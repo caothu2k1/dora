@@ -10,10 +10,10 @@
 //! | 16     | 8         | `data_offset` (u64 LE), from the segment base    |
 //! | 24     | 8         | `ipc_flag` (u64 LE), 1 = CUDA IPC handle valid   |
 //! | 32     | 64        | CUDA IPC handle                                  |
-//! | 96     | 8         | `write_gen` (u64 LE) seqlock, even = complete    |
-//! | 104    | 152       | reserved                                         |
+//! | 96     | 8         | `write_gen[0]` (u64 LE) seqlock, even = complete |
+//! | 104    | 152       | `write_gen[1..20]`, one per slot; else reserved  |
 //! | 256    | `json_len`| metadata JSON, padded to a 256-byte multiple     |
-//! | `data_offset` | payload |                                           |
+//! | `data_offset` | payload |                                             |
 
 use serde_json::Value;
 
@@ -27,6 +27,26 @@ pub const OFFSET_IPC_FLAG: usize = 24;
 pub const OFFSET_IPC_HANDLE: usize = 32;
 pub const IPC_HANDLE_LEN: usize = 64;
 pub const OFFSET_WRITE_GEN: usize = 96;
+
+/// How many seqlock generations the fixed header holds, one per slot.
+///
+/// A pool whose payload is a ring of slots needs a generation per slot, not
+/// one for the segment: with a single word a write to *any* slot invalidates a
+/// concurrent read of *every other* slot, so a reader is told its frame tore
+/// when nothing touched it -- at a rate of one false report per write rather
+/// than per lap of the ring. The words are an array based at
+/// `OFFSET_WRITE_GEN`, so slot 0 IS the original single generation and a
+/// segment whose writer never names a slot is byte-identical to every segment
+/// written before this existed. The other 19 come out of the reserved tail,
+/// which `write_header` has always zero-filled and `parse_header` deliberately
+/// stops short of -- so nothing on the wire moved and no version gate is
+/// needed.
+pub const SLOT_GEN_CAPACITY: usize = (HEADER_SIZE - OFFSET_WRITE_GEN) / 8;
+
+/// Byte offset of slot `slot`'s generation word, or `None` past capacity.
+pub fn slot_gen_offset(slot: usize) -> Option<usize> {
+    (slot < SLOT_GEN_CAPACITY).then(|| OFFSET_WRITE_GEN + slot * 8)
+}
 
 /// Decoded metadata JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,8 +223,9 @@ pub fn write_header(buf: &mut [u8], json: &str) -> Result<(), String> {
         .copy_from_slice(&(data_offset as u64).to_le_bytes());
     buf[OFFSET_IPC_FLAG..OFFSET_IPC_FLAG + 8].copy_from_slice(&0u64.to_le_bytes());
     buf[OFFSET_IPC_HANDLE..OFFSET_IPC_HANDLE + IPC_HANDLE_LEN].fill(0);
-    buf[OFFSET_WRITE_GEN..OFFSET_WRITE_GEN + 8].copy_from_slice(&0u64.to_le_bytes());
-    buf[OFFSET_WRITE_GEN + 8..HEADER_SIZE].fill(0);
+    // Every generation word, not just slot 0's: zero is even, so all
+    // SLOT_GEN_CAPACITY slots start out reading as "complete".
+    buf[OFFSET_WRITE_GEN..HEADER_SIZE].fill(0);
     buf[HEADER_SIZE..HEADER_SIZE + json_len].copy_from_slice(json.as_bytes());
     buf[HEADER_SIZE + json_len..data_offset].fill(0);
     Ok(())

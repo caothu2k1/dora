@@ -65,14 +65,24 @@ namespace dora {
 /// the cycle and free it properly. Free the pool after the guard's scope ends.
 class PoolWriteGuard {
   public:
-    /// Opens a write cycle on `pool`.
+    /// Opens a write cycle on `pool`, bracketed by slot `slot`'s generation.
     ///
-    /// Throws `std::runtime_error` if a cycle is already open on this handle.
-    /// Nothing is left open when it throws.
-    explicit PoolWriteGuard(::rust::Box<::DoraMemoryPool> &pool) : pool_(pool) {
+    /// Leave `slot` at 0 when the payload is one buffer — then there is only
+    /// one frame and only one generation, which is the case this pool was
+    /// built for. **Pass the slot when the payload is a ring**, so that a
+    /// consumer reading a different slot is not told its frame tore. A ring
+    /// writer that leaves this at 0 gets the old whole-segment behaviour:
+    /// every write invalidates every concurrent read, and a four-slot ring
+    /// rejects three intact frames for each genuine tear.
+    ///
+    /// Throws `std::runtime_error` if a cycle is already open on this handle,
+    /// or if `slot` is past the 20 the header holds. Nothing is left open
+    /// when it throws.
+    explicit PoolWriteGuard(::rust::Box<::DoraMemoryPool> &pool, ::std::size_t slot = 0)
+        : pool_(pool) {
         const ::std::uint64_t payload_ptr = ::pool_payload_ptr(pool_);
         const ::std::size_t payload_len = ::pool_payload_len(pool_);
-        ::DoraResult result = ::pool_begin_write(pool_);
+        ::DoraResult result = ::pool_begin_write(pool_, slot);
         if (!result.error.empty()) {
             throw ::std::runtime_error("dora::PoolWriteGuard: " + ::std::string(result.error));
         }
@@ -229,8 +239,10 @@ class PoolReadGuard {
     /// Throws `std::runtime_error` when there is no payload to read in the
     /// mapping: an `ipc` pool, whose bytes are in device memory and reachable
     /// only through `view_ipc_handle`, or a pool that has already been freed.
-    explicit PoolReadGuard(const ::rust::Box<::DoraMemoryPoolView> &view)
-        : view_(view), payload_(open_payload(view)), read_(::view_begin_read(view)) {}
+    explicit PoolReadGuard(const ::rust::Box<::DoraMemoryPoolView> &view,
+                           ::std::size_t slot = 0)
+        : view_(view), payload_(open_payload(view)),
+          read_(::view_begin_read(view, slot)) {}
 
     PoolReadGuard(const PoolReadGuard &) = delete;
     PoolReadGuard &operator=(const PoolReadGuard &) = delete;

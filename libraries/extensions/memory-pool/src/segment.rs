@@ -11,16 +11,17 @@ use shared_memory_extended::{Shmem, ShmemConf};
 
 use crate::doradma::{
     self, HEADER_SIZE, OFFSET_WRITE_GEN, ParsedHeader, data_offset_for, metadata_json,
-    parse_header, write_header,
+    parse_header, slot_gen_offset, write_header,
 };
 use crate::naming;
 use crate::seqlock;
 
-/// Re-exported because it appears in [`PoolSegment::begin_read`]'s signature.
-/// The `seqlock` module itself is crate-private: nothing outside this crate
-/// has any business publishing a generation, which is what `seqlock`'s writer
-/// half lets you do with nothing but an `unsafe` block and a fabricated
-/// token — exactly the hole [`PoolSegment::begin_write`] closes.
+/// Re-exported so [`SlotRead`], which wraps one and is what
+/// [`PoolSegment::begin_read_at`] hands out, has a resolvable name for it. The
+/// `seqlock` module itself is crate-private: nothing outside this crate has
+/// any business publishing a generation, which is what `seqlock`'s writer half
+/// lets you do with nothing but an `unsafe` block and a fabricated token —
+/// exactly the hole [`PoolSegment::begin_write_at`] closes.
 pub use crate::seqlock::OpeningSample;
 
 /// Mirrors the daemon's per-pool size cap so a node fails locally, with a
@@ -218,7 +219,7 @@ pub struct PoolSegment {
     /// looks complete to every reader forever. Keeping it inside also makes a
     /// doubled `begin_write` and a missing `end_write` observable, neither of
     /// which a token-passing API can see.
-    pending_write: Option<u64>,
+    pending_write: Option<(usize, u64)>,
 }
 
 // Hand-written because `Shmem` is not `Debug`, and required rather than
@@ -543,8 +544,11 @@ impl PoolSegment {
         self.header.ipc_handle.as_ref()
     }
 
-    fn gen_ptr(&self) -> *mut u64 {
-        unsafe { self.shmem.as_ptr().add(OFFSET_WRITE_GEN) as *mut u64 }
+    fn gen_ptr(&self, slot: usize) -> Option<*mut u64> {
+        // None past capacity rather than a clamp onto slot 0: sharing one word
+        // between two slots is the confusion this array exists to end, and it
+        // would be silent. Every caller reads None as "torn".
+        Some(unsafe { self.shmem.as_ptr().add(slot_gen_offset(slot)?) as *mut u64 })
     }
 
     /// Open a write cycle, marking the payload incomplete until
@@ -576,6 +580,24 @@ impl PoolSegment {
     /// the write cycle is `&mut self` precisely so the borrow checker
     /// serialises it — which it can only do within a single thread.
     pub fn begin_write(&mut self) -> Result<(), String> {
+        self.begin_write_at(0)
+    }
+
+    /// Open a write cycle on one slot of a payload ring.
+    ///
+    /// Only slot `slot`'s generation moves, so a reader holding a different
+    /// slot is left alone. That is what the array is for. With a single word
+    /// per segment, a producer writing every 33 ms invalidates every read
+    /// longer than 33 ms — even though the ring does not overwrite the
+    /// reader's *own* slot until `slot_count` frames have gone by, four times
+    /// longer on a four-slot ring. Those readers are told their frame tore
+    /// when nothing touched it, and a consumer that discards on a torn read
+    /// then throws away three intact frames for every genuine one.
+    ///
+    /// The caller owns the slot-to-byte-range mapping; this only brackets it.
+    /// Writing outside slot `slot`'s bytes under this cycle publishes those
+    /// bytes with no generation around them.
+    pub fn begin_write_at(&mut self, slot: usize) -> Result<(), String> {
         if self.transport == Transport::Ipc {
             return Err(format!(
                 "pool `{}` is ipc-backed: its payload lives in device memory, not in this \
@@ -590,7 +612,14 @@ impl PoolSegment {
                 self.name
             ));
         }
-        self.pending_write = Some(unsafe { seqlock::begin_write(self.gen_ptr()) });
+        let Some(gen_ptr) = self.gen_ptr(slot) else {
+            return Err(format!(
+                "pool `{}`: slot {slot} has no generation word; the header holds {}",
+                self.name,
+                doradma::SLOT_GEN_CAPACITY
+            ));
+        };
+        self.pending_write = Some((slot, unsafe { seqlock::begin_write(gen_ptr) }));
         Ok(())
     }
 
@@ -601,10 +630,17 @@ impl PoolSegment {
     /// previous frame: the payload is written in place, so a failed write has
     /// already destroyed it.
     pub fn end_write(&mut self, ok: bool) {
-        let Some(pre_write_gen) = self.pending_write.take() else {
+        let Some((slot, pre_write_gen)) = self.pending_write.take() else {
             return;
         };
-        unsafe { seqlock::end_write(self.gen_ptr(), pre_write_gen, ok) }
+        // The slot is carried rather than passed back in: end_write must close
+        // the cycle begin_write_at opened, and a caller cannot be trusted to
+        // name the same slot twice. It was proved in range before it was
+        // stored, so this cannot fail.
+        let Some(gen_ptr) = self.gen_ptr(slot) else {
+            return;
+        };
+        unsafe { seqlock::end_write(gen_ptr, pre_write_gen, ok) }
     }
 
     /// Whether a write cycle is currently open.
@@ -655,22 +691,70 @@ impl PoolSegment {
     /// Spins while a write is in progress, up to a fixed budget, then returns
     /// the odd sample it saw — which makes [`read_valid`](Self::read_valid)
     /// return false. A writer killed mid-write therefore cannot hang a reader.
-    pub fn begin_read(&self) -> seqlock::OpeningSample {
+    pub fn begin_read(&self) -> SlotRead {
+        self.begin_read_at(0)
+    }
+
+    /// Sample slot `slot`'s generation before reading that slot's bytes.
+    ///
+    /// A slot past [`SLOT_GEN_CAPACITY`](doradma::SLOT_GEN_CAPACITY) yields a
+    /// token that can never be valid, so an out-of-range read is refused
+    /// rather than quietly aliased onto slot 0.
+    pub fn begin_read_at(&self, slot: usize) -> SlotRead {
         const SPIN_BUDGET: u32 = 10_000;
+        let Some(gen_ptr) = self.gen_ptr(slot) else {
+            return SlotRead { slot, sample: None };
+        };
         for _ in 0..SPIN_BUDGET {
-            let sample = unsafe { seqlock::begin_read(self.gen_ptr()) };
+            let sample = unsafe { seqlock::begin_read(gen_ptr) };
             if sample.is_complete() {
-                return sample;
+                return SlotRead {
+                    slot,
+                    sample: Some(sample),
+                };
             }
             std::hint::spin_loop();
         }
-        unsafe { seqlock::begin_read(self.gen_ptr()) }
+        SlotRead {
+            slot,
+            sample: Some(unsafe { seqlock::begin_read(gen_ptr) }),
+        }
     }
 
-    /// True when the payload read since [`begin_read`](Self::begin_read) is
-    /// intact: no write started or finished in between.
-    pub fn read_valid(&self, opening: seqlock::OpeningSample) -> bool {
-        unsafe { seqlock::read_completed(self.gen_ptr(), opening) }
+    /// True when the payload read since [`begin_read_at`](Self::begin_read_at)
+    /// is intact: no write started or finished **on that slot** in between.
+    pub fn read_valid(&self, opening: SlotRead) -> bool {
+        let (Some(gen_ptr), Some(sample)) = (self.gen_ptr(opening.slot), opening.sample) else {
+            return false;
+        };
+        unsafe { seqlock::read_completed(gen_ptr, sample) }
+    }
+}
+
+/// The opening sample of a zero-copy read, carrying the slot it was taken on.
+///
+/// The slot travels *with* the sample rather than beside it so `read_valid`
+/// cannot be handed the wrong one — the same reason
+/// [`seqlock::OpeningSample`] keeps its inner value private. `sample` is
+/// `None` only for a slot past [`SLOT_GEN_CAPACITY`](doradma::SLOT_GEN_CAPACITY),
+/// which is never valid.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotRead {
+    slot: usize,
+    sample: Option<seqlock::OpeningSample>,
+}
+
+impl SlotRead {
+    /// True when the sample itself denotes a complete payload. A reader may
+    /// skip the copy entirely when this is false — `read_valid` would reject
+    /// it regardless.
+    pub fn is_complete(self) -> bool {
+        self.sample.is_some_and(seqlock::OpeningSample::is_complete)
+    }
+
+    /// The slot this read was opened on.
+    pub fn slot(self) -> usize {
+        self.slot
     }
 }
 
@@ -864,6 +948,90 @@ mod tests {
             !reader.read_valid(opening),
             "a new frame invalidates the old sample"
         );
+    }
+
+    /// The whole reason the generation is an array. A ring's reader holds one
+    /// slot while the producer fills the next; before this, that write moved
+    /// the segment's only generation word and the reader was told its own
+    /// slot had torn. On a four-slot ring three of every four writes are to
+    /// some other slot, so a consumer that discards on a torn read discarded
+    /// three intact frames for every genuine one — and a consumer whose work
+    /// outlasts the frame period discarded all of them.
+    #[test]
+    fn a_write_to_another_slot_leaves_this_slots_read_valid() {
+        let (guard, mut writer) = create_test_segment("ring-other-slot", 64);
+        let reader = PoolSegment::open(guard.name()).expect("open");
+
+        let opening = reader.begin_read_at(0);
+        assert!(opening.is_complete());
+
+        // A whole lap of a four-slot ring, minus the reader's own slot.
+        for slot in 1..4 {
+            writer.begin_write_at(slot).expect("begin");
+            writer.end_write(true);
+        }
+
+        assert!(
+            reader.read_valid(opening),
+            "slot 0's read must survive writes to slots 1..4"
+        );
+    }
+
+    /// The hazard the seqlock exists for is still caught: the producer coming
+    /// back round to the slot being read.
+    #[test]
+    fn a_write_to_the_same_slot_still_invalidates_it() {
+        let (guard, mut writer) = create_test_segment("ring-same-slot", 64);
+        let reader = PoolSegment::open(guard.name()).expect("open");
+
+        let opening = reader.begin_read_at(2);
+        writer.begin_write_at(2).expect("begin");
+        assert!(!reader.read_valid(opening), "mid-write must be invalid");
+        writer.end_write(true);
+        assert!(
+            !reader.read_valid(opening),
+            "a completed write to this slot invalidates the old sample"
+        );
+    }
+
+    /// Two readers on two slots are independent in both directions — neither
+    /// write disturbs the other's sample.
+    #[test]
+    fn two_slots_carry_independent_generations() {
+        let (guard, mut writer) = create_test_segment("ring-independent", 64);
+        let reader = PoolSegment::open(guard.name()).expect("open");
+
+        let read_a = reader.begin_read_at(0);
+        let read_b = reader.begin_read_at(1);
+
+        writer.begin_write_at(1).expect("begin");
+        writer.end_write(true);
+
+        assert!(reader.read_valid(read_a), "slot 0 was not written");
+        assert!(!reader.read_valid(read_b), "slot 1 was");
+    }
+
+    /// Out of range is refused, not folded onto slot 0 — which would silently
+    /// give two slots one generation, the exact bug this array removes.
+    #[test]
+    fn a_slot_past_capacity_is_refused_rather_than_aliased_onto_slot_zero() {
+        let (guard, mut writer) = create_test_segment("ring-capacity", 64);
+        let reader = PoolSegment::open(guard.name()).expect("open");
+        let past = doradma::SLOT_GEN_CAPACITY;
+
+        let err = writer.begin_write_at(past).unwrap_err();
+        assert!(
+            err.contains("no generation word"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !writer.write_in_progress(),
+            "a refused begin_write_at must not leave a cycle open"
+        );
+
+        let opening = reader.begin_read_at(past);
+        assert!(!opening.is_complete());
+        assert!(!reader.read_valid(opening));
     }
 
     /// `begin_read` gives up after its spin budget and hands back the odd
