@@ -764,6 +764,31 @@ fn free_pool_and_notify(
     Ok(())
 }
 
+/// Free every pool a node registered, telling the nodes that read them, when
+/// the node is about to restart.
+///
+/// A node killed or crashed without freeing its pools leaves their segments
+/// under the names its successor creates `O_EXCL`, so every restart would fail
+/// at pool creation. A node that is not restarting keeps its pools: a reader
+/// may still free one after the registrar is gone.
+fn free_pools_of_restarting_node(
+    memory_pool: &MemoryPoolManager,
+    dataflow: Option<&RunningDataflow>,
+    dataflow_id: &str,
+    node_id: &str,
+    clock: &HLC,
+) {
+    for id in memory_pool.pools_registered_by(dataflow_id, node_id) {
+        if let Err(err) = free_pool_and_notify(memory_pool, dataflow, &id, node_id, clock) {
+            tracing::warn!(
+                pool = %id.id,
+                %node_id,
+                "failed to free the pool of a restarting node: {err}"
+            );
+        }
+    }
+}
+
 /// Send `NodeEvent::FreeMemoryPool` to every node that registered or read
 /// the pool, except the node that initiated the free — it releases its own
 /// resources synchronously.
@@ -6045,6 +6070,14 @@ impl Daemon {
                         )
                         .await;
 
+                    free_pools_of_restarting_node(
+                        &self.memory_pool,
+                        self.running.get(&dataflow_id),
+                        &dataflow_id.to_string(),
+                        node_id.as_ref(),
+                        &self.clock,
+                    );
+
                     // Notify downstream nodes about the restart
                     if let Some(dataflow) = self.running.get(&dataflow_id) {
                         let downstream: BTreeSet<NodeId> = dataflow
@@ -8133,6 +8166,73 @@ mod fault_tolerance_tests {
 
         free_pool_and_notify(&pools, None, &id, "registrar", &clock).expect("free should succeed");
         assert_eq!(pools.table_size(), 0);
+    }
+
+    /// A node killed without freeing its pools must not keep them past its
+    /// restart: its successor creates the same segment names `O_EXCL`. Its
+    /// readers are told to drop their views; another node's pool, and the
+    /// same node's pool in another dataflow, stay.
+    #[test]
+    fn a_restarting_node_s_pools_are_freed_and_their_readers_told() {
+        let clock = test_clock();
+        let mut df = test_dataflow();
+        let pools = MemoryPoolManager::new();
+
+        let producer: NodeId = "producer".to_string().into();
+        let reader: NodeId = "reader".to_string().into();
+        let other: NodeId = "other".to_string().into();
+        let (mut reader_rx, _) = subscribe_test_node(&mut df, &reader, NODE_EVENT_CHANNEL_CAPACITY);
+
+        let frames = test_pool_id("frames");
+        pools
+            .register_memory_pool(frames.clone(), test_pool_metadata(), producer.to_string())
+            .unwrap();
+        pools
+            .read_memory_pool(&frames, reader.as_ref())
+            .expect("pool should exist");
+        let others = test_pool_id("others");
+        pools
+            .register_memory_pool(others.clone(), test_pool_metadata(), other.to_string())
+            .unwrap();
+        let elsewhere = MemoryPoolId {
+            dataflow_id: Uuid::from_u128(1).to_string(),
+            id: "frames".into(),
+        };
+        pools
+            .register_memory_pool(
+                elsewhere.clone(),
+                test_pool_metadata(),
+                producer.to_string(),
+            )
+            .unwrap();
+
+        free_pools_of_restarting_node(
+            &pools,
+            Some(&df),
+            &Uuid::nil().to_string(),
+            producer.as_ref(),
+            &clock,
+        );
+
+        assert_eq!(
+            pools.pools_registered_by(&Uuid::nil().to_string(), producer.as_ref()),
+            Vec::<MemoryPoolId>::new()
+        );
+        assert_eq!(
+            freed_pool_ids(&drain_events(&mut reader_rx)),
+            vec!["frames"]
+        );
+        assert_eq!(
+            pools.table_size(),
+            2,
+            "the other node's and dataflow's pools stay"
+        );
+        pools
+            .read_memory_pool(&others, reader.as_ref())
+            .expect("another node's pool must stay");
+        pools
+            .read_memory_pool(&elsewhere, reader.as_ref())
+            .expect("the same node's pool in another dataflow must stay");
     }
 
     // -- Test 1: close_input removes input, sends InputClosed, no AllInputsClosed with remaining inputs --

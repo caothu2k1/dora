@@ -126,6 +126,15 @@ impl MemoryPoolManager {
         Ok(())
     }
 
+    /// The pools `node_id` registered in `dataflow_id`.
+    pub fn pools_registered_by(&self, dataflow_id: &str, node_id: &str) -> Vec<MemoryPoolId> {
+        self.lock_table()
+            .iter()
+            .filter(|(id, entry)| id.dataflow_id == dataflow_id && entry.registered_by == node_id)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Get the current number of entries in the memory pool table.
     pub fn table_size(&self) -> usize {
         let table = self.lock_table();
