@@ -282,6 +282,10 @@ mod ffi {
         /// reason about its own declared interface without re-parsing
         /// the dataflow yaml.
         fn node_config_json(output_sender: &Box<OutputSender>) -> Result<String>;
+        /// The ids of this node's declared outputs, from the dataflow
+        /// descriptor, so a node can skip work no output carries
+        /// without parsing `node_config_json`.
+        fn node_outputs(output_sender: &Box<OutputSender>) -> Vec<String>;
         /// Return the full `Descriptor` (the parsed dataflow yaml)
         /// serialized as JSON. Useful for introspecting peer nodes,
         /// listing all topics, etc. May fail if the daemon hasn't
@@ -1187,6 +1191,17 @@ fn close_outputs(
 fn node_config_json(output_sender: &Box<OutputSender>) -> eyre::Result<String> {
     serde_json::to_string(output_sender.0.node_config())
         .map_err(|e| eyre!("failed to serialize node config: {e}"))
+}
+
+#[allow(clippy::borrowed_box)] // signature dictated by cxx::bridge
+fn node_outputs(output_sender: &Box<OutputSender>) -> Vec<String> {
+    output_sender
+        .0
+        .node_config()
+        .outputs
+        .iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 #[allow(clippy::borrowed_box)] // signature dictated by cxx::bridge
